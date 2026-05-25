@@ -19,7 +19,7 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
  
-from commit1_data_pipeline import (
+from Data_Pipeline import (
     load_eth_data, add_technical_indicators,
     walk_forward_split, create_sequences,
     inverse_close, FEATURES,

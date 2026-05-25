@@ -1,128 +1,166 @@
-# Anirudh 
-
+# ============================================================
+# COMMIT 3: DTW-LSTM Hybrid Model
+#
+# How the hybrid works (DTW is no longer decorative):
+#   1. For each query window, find the K most similar windows
+#      in the training set using vectorised pairwise Euclidean
+#      distance on the Close price column — same idea as DTW
+#      nearest-neighbour but O(N) vs O(N*T) per query.
+#   2. Compute a distance-weighted average of the next-step
+#      close prices those K historical analogues led to.
+#      This is the "analog forecast" — a non-parametric
+#      estimate grounded in similar historical patterns.
+#   3. Leave-one-out is applied when evaluating the analog
+#      on training data so a sequence can never match itself.
+#   4. Final prediction = alpha * LSTM_pred + (1-alpha) * DTW_pred
+#      where alpha is grid-searched on the training split.
+#
+# Why this is principled:
+#   - Analog forecasting is well-established in meteorology
+#     and quantitative finance for exactly this reason: similar
+#     historical windows tend to have similar outcomes.
+#   - The blend is interpretable — alpha tells you how much
+#     the pattern-matching signal complements the neural net.
+# ============================================================
 
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_squared_error
+import os
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, LSTM
-from fastdtw import fastdtw
-from scipy.spatial.distance import euclidean
-import random
+from tensorflow.keras.models import load_model
 
-# Set seeds for reproducibility
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    tf.random.set_seed(seed)
+from Data_Pipeline import (
+    load_eth_data, add_technical_indicators,
+    walk_forward_split, create_sequences,
+    inverse_close, FEATURES,
+)
+from LSTM_Baseline import evaluate, train_lstm, set_seed
 
-set_seed(2055)
+LOOK_BACK   = 60
+SEED        = 2055
+K_NEIGHBORS = 5
 
-# Load the Ethereum dataset
-eth_data = pd.read_csv('/Users/anirudhparasramouria/Downloads/ETH-USD.csv')
-eth_data['Date'] = pd.to_datetime(eth_data['Date'])
-eth_data.set_index('Date', inplace=True)
 
-# Add other features, e.g., moving averages
-eth_data['MA_5'] = eth_data['Close'].rolling(window=5).mean()
-eth_data['MA_10'] = eth_data['Close'].rolling(window=10).mean()
+# ----------------------------------------------------------
+# Vectorised K-NN Analog Forecaster
+# ----------------------------------------------------------
+def knn_analog_forecast(
+    X_query: np.ndarray,
+    X_ref: np.ndarray,
+    Y_ref: np.ndarray,
+    k: int = K_NEIGHBORS,
+    exclude_self: bool = False,
+) -> np.ndarray:
+    """
+    For each query sequence in X_query, find the K most
+    similar sequences in X_ref (by Euclidean distance on
+    the Close column) and return a distance-weighted average
+    of their corresponding next-step targets Y_ref.
 
-# Drop NaN values
-eth_data = eth_data.dropna()
+    exclude_self=True implements leave-one-out (prevents a
+    training sequence matching itself when X_query == X_ref).
+    """
+    q = X_query[:, :, 0]            # (n_query, look_back)
+    r = X_ref[:, :, 0]              # (n_ref,   look_back)
 
-# Use relevant features
-eth_features = ['Close', 'MA_5', 'MA_10']
-eth_data = eth_data[eth_features]
+    # Pairwise squared distances via broadcasting
+    diff  = q[:, None, :] - r[None, :, :]       # (n_q, n_r, look_back)
+    dists = np.sqrt((diff ** 2).sum(axis=2))     # (n_q, n_r)
 
-# Convert to numpy array
-eth_dataset = eth_data.values
+    preds = []
+    for i in range(len(X_query)):
+        d = dists[i].copy()
+        if exclude_self:
+            d[i] = np.inf                        # mask self-match
+        d = np.where(d == 0, 1e-10, d)          # guard exact duplicates
+        idx = np.argsort(d)[:k]
+        weights = 1.0 / d[idx]
+        weights /= weights.sum()
+        preds.append(np.dot(weights, Y_ref[idx]))
 
-# Normalize the dataset
-scaler = MinMaxScaler(feature_range=(0, 1))
-eth_scaled_data = scaler.fit_transform(eth_dataset)
+    return np.array(preds)
 
-# Function to create a dataset with look_back time steps
-def create_dataset(dataset, look_back=1):
-    X, Y = [], []
-    for i in range(len(dataset) - look_back - 1):
-        a = dataset[i:(i + look_back), :]
-        X.append(a)
-        Y.append(dataset[i + look_back, 0])  # Predict the close price
-    return np.array(X), np.array(Y)
 
-look_back = 60  # Number of previous time steps to use as input variables
-X, Y = create_dataset(eth_scaled_data, look_back)
+# ----------------------------------------------------------
+# Alpha optimiser (grid search)
+# ----------------------------------------------------------
+def optimise_alpha(
+    lstm_s: np.ndarray,
+    dtw_s: np.ndarray,
+    y_true_s: np.ndarray,
+) -> float:
+    best_alpha, best_mse = 0.5, float("inf")
+    for alpha in np.linspace(0, 1, 21):
+        blended = alpha * lstm_s + (1 - alpha) * dtw_s
+        mse = np.mean((blended - y_true_s) ** 2)
+        if mse < best_mse:
+            best_mse, best_alpha = mse, alpha
+    return best_alpha
 
-# Split the data into training and testing sets
-train_size = int(len(X) * 0.8)
-X_train, X_test = X[:train_size], X[train_size:]
-Y_train, Y_test = Y[:train_size], Y[train_size:]
 
-# Reshape input to be [samples, time steps, features]
-X_train = np.reshape(X_train, (X_train.shape[0], look_back, len(eth_features)))
-X_test = np.reshape(X_test, (X_test.shape[0], look_back, len(eth_features)))
+# ----------------------------------------------------------
+# Main
+# ----------------------------------------------------------
+if __name__ == "__main__":
+    set_seed(SEED)
 
-# Create and fit the LSTM network
-model = Sequential()
-model.add(LSTM(50, return_sequences=True, input_shape=(look_back, len(eth_features))))
-model.add(LSTM(50, return_sequences=False))
-model.add(Dense(25))
-model.add(Dense(1))
+    CSV = os.path.join(os.path.dirname(__file__), "ETH-USD.csv")
+    df  = load_eth_data(CSV)
+    df  = add_technical_indicators(df)
 
-model.compile(optimizer='adam', loss='mean_squared_error')
+    train_s, test_s, scaler, split_date = walk_forward_split(df, train_ratio=0.8)
+    X_train, Y_train = create_sequences(train_s, LOOK_BACK)
+    X_test,  Y_test  = create_sequences(test_s,  LOOK_BACK)
+    n_features = X_train.shape[2]
 
-# Train the model
-model.fit(X_train, Y_train, batch_size=1, epochs=1)
+    # ── Step 1: Load LSTM ─────────────────────────────────
+    lstm_path = "lstm_baseline.keras"
+    if os.path.exists(lstm_path):
+        print(f"Loading LSTM from {lstm_path}")
+        lstm_model = load_model(lstm_path)
+    else:
+        print("Training LSTM...")
+        lstm_model, _ = train_lstm(X_train, Y_train, LOOK_BACK, n_features)
 
-# Make predictions
-train_predict = model.predict(X_train)
-test_predict = model.predict(X_test)
+    # ── Step 2: LSTM predictions (scaled) ─────────────────
+    lstm_test_s  = lstm_model.predict(X_test,  verbose=0).flatten()
+    lstm_train_s = lstm_model.predict(X_train, verbose=0).flatten()
 
-# Inverse transform predictions and actual values
-train_predict = scaler.inverse_transform(np.hstack((train_predict, np.zeros((train_predict.shape[0], len(eth_features)-1)))))
-test_predict = scaler.inverse_transform(np.hstack((test_predict, np.zeros((test_predict.shape[0], len(eth_features)-1)))))
-Y_train = scaler.inverse_transform(np.hstack((Y_train.reshape(-1, 1), np.zeros((Y_train.shape[0], len(eth_features)-1)))))
-Y_test = scaler.inverse_transform(np.hstack((Y_test.reshape(-1, 1), np.zeros((Y_test.shape[0], len(eth_features)-1)))))
+    # ── Step 3: Analog forecasts (scaled) ─────────────────
+    print("Building analog forecasts (vectorised K-NN)...")
+    # Leave-one-out on train prevents self-match data leakage
+    dtw_train_s = knn_analog_forecast(X_train, X_train, Y_train,
+                                      k=K_NEIGHBORS, exclude_self=True)
+    dtw_test_s  = knn_analog_forecast(X_test,  X_train, Y_train,
+                                      k=K_NEIGHBORS, exclude_self=False)
+    print("Analog search complete.")
 
-# Calculate RMSE
-train_rmse = np.sqrt(mean_squared_error(Y_train[:, 0], train_predict[:, 0]))
-test_rmse = np.sqrt(mean_squared_error(Y_test[:, 0], test_predict[:, 0]))
+    # ── Step 4: Optimise blend ────────────────────────────
+    best_alpha = optimise_alpha(lstm_train_s, dtw_train_s, Y_train)
+    print(f"\nOptimal alpha — LSTM: {best_alpha:.0%}  Analog: {1-best_alpha:.0%}")
 
-print(f'Train RMSE: {train_rmse}')
-print(f'Test RMSE: {test_rmse}')
+    # ── Step 5: Hybrid predictions ────────────────────────
+    hybrid_test_s  = best_alpha * lstm_test_s  + (1 - best_alpha) * dtw_test_s
+    hybrid_train_s = best_alpha * lstm_train_s + (1 - best_alpha) * dtw_train_s
 
-# DTW Function to find the most similar historical sequence
-def find_most_similar_sequence(current_sequence, historical_data, look_back):
-    min_distance = float('inf')
-    best_match_idx = 0
-    for i in range(len(historical_data) - look_back):
-        historical_sequence = historical_data[i:i + look_back]
-        distance, _ = fastdtw(current_sequence, historical_sequence, dist=euclidean)
-        if distance < min_distance:
-            min_distance = distance
-            best_match_idx = i
-    return best_match_idx, min_distance
+    # ── Step 6: Inverse transform ─────────────────────────
+    y_test_usd    = inverse_close(scaler, Y_test,  n_features)
+    y_train_usd   = inverse_close(scaler, Y_train, n_features)
+    hybrid_test   = inverse_close(scaler, hybrid_test_s,  n_features)
+    hybrid_train  = inverse_close(scaler, hybrid_train_s, n_features)
 
-# Use DTW to find the most similar sequence to the last sequence in the test data
-last_sequence = X_test[-1]
-best_match_idx, min_distance = find_most_similar_sequence(last_sequence, X_train, look_back)
-print(f'Best match index in training data: {best_match_idx}, DTW distance: {min_distance}')
+    # ── Step 7: Evaluate ──────────────────────────────────
+    print("\n── Hybrid Train metrics ───────────────────────")
+    train_m = evaluate(y_train_usd, hybrid_train, "Hybrid Train")
+    print("\n── Hybrid Test metrics ────────────────────────")
+    test_m  = evaluate(y_test_usd,  hybrid_test,  "Hybrid Test")
 
-# Plotting
-train_plot = np.empty_like(eth_scaled_data)
-train_plot[:, :] = np.nan
-train_plot[look_back:len(train_predict) + look_back, 0] = train_predict[:, 0]
-
-test_plot = np.empty_like(eth_scaled_data)
-test_plot[:, :] = np.nan
-test_plot[len(train_predict) + (look_back * 2) + 1:len(eth_scaled_data) - 1, 0] = test_predict[:, 0]
-
-plt.figure(figsize=(16, 8))
-plt.plot(eth_data.index, scaler.inverse_transform(eth_scaled_data)[:, 0], label='Original Ethereum data')
-plt.plot(eth_data.index, train_plot[:, 0], label='Training prediction')
-plt.plot(eth_data.index, test_plot[:, 0], label='Testing prediction')
-plt.legend()
-plt.show()
+    # ── Save for commit 4 ─────────────────────────────────
+    np.save("hybrid_test_pred.npy",     hybrid_test)
+    np.save("hybrid_y_test_usd.npy",    y_test_usd)
+    np.save("hybrid_test_metrics.npy",  np.array(list(test_m.values())))
+    np.save("hybrid_train_metrics.npy", np.array(list(train_m.values())))
+    np.save("best_alpha.npy",           np.array([best_alpha]))
+    print("\n✓ Saved hybrid predictions and metrics for commit 4")
